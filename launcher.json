@@ -1,0 +1,94 @@
+{
+  "groups": [
+    {
+      "name": "Nothing",
+      "apps": []
+    },
+    {
+      "name": "Study",
+      "apps": [
+        {
+          "name": "Obsidian",
+          "command": "obsidian",
+          "args": [],
+          "use_shell": false
+        },
+        {
+          "name": "Browser",
+          "command": "brave-browser",
+          "args": [],
+          "use_shell": false
+        }
+      ]
+    },
+    {
+      "name": "Docker",
+      "apps": [
+        {
+          "name": "Start Docker Containers",
+          "command": "sh",
+          "args": ["-c", "docker start $(docker ps -aq)"],
+          "use_shell": true
+        },
+        {
+          "name": "Terminal",
+          "command": "konsole",
+          "args": [],
+          "use_shell": false
+        },
+        {
+          "name": "Obsidian",
+          "command": "obsidian",
+          "args": [],
+          "use_shell": false
+        }
+      ]
+    },
+    {
+      "name": "Dev",
+      "apps": [
+        {
+          "name": "VS Code",
+          "command": "code",
+          "args": [],
+          "use_shell": false
+        },
+        {
+          "name": "Obsidian",
+          "command": "obsidian",
+          "args": [],
+          "use_shell": false
+        },
+        {
+          "name": "Terminal",
+          "command": "konsole",
+          "args": [],
+          "use_shell": false
+        }
+      ]
+    },
+    {
+      "name": "Play",
+      "apps": [
+        {
+          "name": "Discord",
+          "command": "discord",
+          "args": [],
+          "use_shell": false
+        },
+        {
+          "name": "Steam",
+          "command": "steam",
+          "args": [],
+          "use_shell": false
+        },
+        {
+          "name": "Spotify",
+          "command": "spotify",
+          "args": [],
+          "use_shell": false
+        }
+      ]
+    }
+  ]
+}

@@ -1,222 +1,239 @@
 // ============================================================================
-// IMPORTS 
+// mkdir -p ~/.config/launcher/
 // ============================================================================
-// Nota primera vez en usar rsut por lo que hay muchos comentarios explicativos
-// En Rust, los imports se hacen con "use" en lugar de "import" o "include"
-
+// ============================================================================
+// IMPORTS
+// ============================================================================
 use ratatui::{
-    backend::CrosstermBackend,           // Backend para manejar la terminal
-    crossterm::{                          // Librería para control de terminal
+    backend::CrosstermBackend,
+    crossterm::{
         event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
-        execute,                          // Macro para ejecutar comandos en terminal
+        execute,
         terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     },
-    layout::{Alignment, Constraint, Direction, Layout},  // Para organizar elementos en pantalla
-    style::{Color, Modifier, Style},     // Estilos: colores, negritas, etc
-    text::{Line, Span},                   // Texto estructurado
-    widgets::{Block, Borders, List, ListItem, Paragraph}, // Widgets de UI
-    Terminal,                             // Terminal principal
+    layout::{Alignment, Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, Paragraph},
+    Terminal,
 };
-use std::io;                              // Entrada/salida estándar
-use std::process::Command;                // Para ejecutar comandos del sistema
+use serde::{Deserialize, Serialize};
+use std::io;
+use std::path::PathBuf;
+use std::process::Command;
 
 // ============================================================================
-// STRUCT App 
+// STRUCTS - Configuración y App
 // ============================================================================
-// En Rust, los "structs" son como registros o estructuras de datos
-// No tienen métodos dentro, los métodos van en un bloque "impl" aparte
 
-struct App {
-    options: Vec<&'static str>,  // Vec = vector dinámico (como vector<> en C++)
-                                 // &'static str = string literal que vive todo el programa
-    selected: usize,             // usize = unsigned integer (como size_t en C++, osea usado para conteos de objetos en memoria)
+/// Representa una aplicación dentro de un grupo
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppCommand {
+    /// Nombre mostrado en la UI
+    pub name: String,
+    /// Comando a ejecutar
+    pub command: String,
+    /// Argumentos opcionales (ej: ["-c", "docker start $(docker ps -aq)"])
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Si true, usa `sh -c` para ejecutar (para comandos complejos)
+    #[serde(default)]
+    pub use_shell: bool,
 }
 
-// ============================================================================
-// BLOQUE "impl" - Aquí van los métodos de App 
-// ============================================================================
+/// Un grupo de aplicaciones a ejecutar juntas
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Group {
+    pub name: String,
+    pub apps: Vec<AppCommand>,
+}
+
+/// Configuración general del launcher
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Config {
+    pub groups: Vec<Group>,
+}
+
+impl Config {
+    /// Cargar configuración desde un archivo JSON
+    pub fn load(path: &PathBuf) -> io::Result<Self> {
+        let contents = std::fs::read_to_string(path)?;
+        serde_json::from_str(&contents)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    /// Cargar configuración desde ubicación estándar
+    /// 1. `./launcher.json`
+    /// 2. `~/.config/launcher/config.json`
+    /// 3. `/etc/launcher/config.json`
+    pub fn load_default() -> io::Result<Self> {
+        let paths = [
+            PathBuf::from("./launcher.json"),
+            dirs::config_dir()
+                .map(|d| d.join("launcher").join("config.json"))
+                .unwrap_or_default(),
+            PathBuf::from("/etc/launcher/config.json"),
+        ];
+
+        for path in &paths {
+            if path.exists() {
+                return Self::load(path);
+            }
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "No config file found. Create launcher.json in current directory.",
+        ))
+    }
+}
+
+/// Estructura principal de la aplicación
+struct App {
+    groups: Vec<String>,  // Nombres de grupos
+    selected: usize,
+    config: Config,
+}
+
 impl App {
-    /// Crea una nueva instancia de App (constructor)
-    /// En Rust la convención es usar "new()"
-    fn new() -> Self {  // Self = el tipo App mismo, es como "App" explícitamente
+    /// Crear nueva instancia desde configuración
+    fn new(config: Config) -> Self {
+        // Extraer solo los nombres de los grupos para la UI
+        let groups = config.groups.iter().map(|g| g.name.clone()).collect();
         App {
-            options: vec!["Nothing", "Study", "Docker", "Dev", "Play"],
+            groups,
             selected: 0,
+            config,
         }
     }
 
-    /// Selecciona la siguiente opción (circular)
-    /// &mut self = referencia mutable (como "this" en C++, pero explícitamente mutable)
-    /// En Rust, por defecto todo es inmutable. Necesitas &mut para modificar
     fn next(&mut self) {
-        // (a + 1) % len da efecto circular: después del último vuelve al primero
-        self.selected = (self.selected + 1) % self.options.len();
+        self.selected = (self.selected + 1) % self.groups.len();
     }
 
-    /// Selecciona la opción anterior (circular)
     fn prev(&mut self) {
         if self.selected > 0 {
             self.selected -= 1;
         } else {
-            // Si estamos en la primera, vamos a la última
-            self.selected = self.options.len() - 1;
+            self.selected = self.groups.len().saturating_sub(1);
         }
     }
 
-    /// Ejecuta el comando según la opción seleccionada
-    /// &self = referencia inmutable (no modificamos la estructura)
-    // TODO: Mejorar manejo de errores
-    // TODO : Hacer que las opciones y comandos sean configurables 
+    /// Ejecutar todas las aplicaciones del grupo seleccionado
     fn select(&self) {
-        // match = switch en C++/JavaScript, pero más poderoso
-        // Aquí comparamos self.options[self.selected] con cada caso
-        match self.options[self.selected] {
-            "Nothing" => {},  // {} vacío = no hacer nada
+        // Verificar que selected es válido
+        if self.selected >= self.config.groups.len() {
+            return;
+        }
+
+        // Acceder al grupo seleccionado desde la configuración        
+        let group = &self.config.groups[self.selected];
+        // Ejecutar cada aplicación del grupo (Esto evita problemas de borrow)
+        for app in &group.apps {
+            Self::execute_command(app);
+        }
+    }
+
+    /// Ejecutar un comando individual de forma desacoplada de la terminal
+    fn execute_command(app: &AppCommand) {
+        let child = if app.use_shell {
+            // Para comandos complejos con pipes, variables, etc
+            Command::new("sh")
+                .arg("-c")
+                .args(&app.args)
+                .spawn()
+        } else {
+            // Para comandos simples
+            let mut cmd = Command::new(&app.command);
+            cmd.args(&app.args);
             
-            "Study" => {
-                // Command::new() crea un proceso nuevo (como fork + exec en C)
-                // spawn() lo inicia en background
-                // .ok() ignora errores (parecido a try-catch pero más limpio)
-                Command::new("obsidian").spawn().ok();
-                Command::new("brave-browser").spawn().ok();
+            // Importante: desacoplar del padre para que la app no muera
+            // cuando cierre la terminal
+            // Esto crea una nueva sesión de proceso con setsid()
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                unsafe {
+                    cmd.pre_exec(|| {
+                        // Cambiar a nuevo session group
+                        libc::setsid();
+                        Ok(())
+                    });
+                }
             }
-            
-            "Docker" => {
-                // arg("-c") y arg("comando") construyen un comando shell
-                // Equivalente a: sh -c "docker start $(docker ps -aq)"
-                Command::new("sh")
-                    .arg("-c")
-                    .arg("docker start $(docker ps -aq)")
-                    .spawn()
-                    .ok();
-                Command::new("konsole").spawn().ok();
-                Command::new("obsidian").spawn().ok();
-            }
-            
-            "Dev" => {
-                Command::new("code").spawn().ok();
-                Command::new("obsidian").spawn().ok();
-            }
-            
-            "Play" => {
-                Command::new("discord").spawn().ok();
-                Command::new("steam").spawn().ok();
-            }
-            
-            _ => {}  // _ = "cualquier otro caso" (como default: en switch)
+            cmd.spawn()
+        };
+
+        if let Err(e) = child {
+            eprintln!("Error al ejecutar {}: {}", app.name, e);
         }
     }
 }
 
 // ============================================================================
-// FUNCIÓN main - Punto de entrada (como main() en C++)
+// FUNCIÓN main
 // ============================================================================
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Result = tipo que puede ser Ok(valor) o Err(error)
-    // Box<dyn std::error::Error> = cualquier tipo de error (similar a Exception en Java)
-    // El ? al final de operaciones propaga errores automáticamente (como throw en C++)
+    // Cargar configuración
+    let config = Config::load_default()?;
 
-    // ========== SETUP DE LA TERMINAL ==========
-    
-    // enable_raw_mode() = que la terminal capture cada tecla inmediatamente
-    // Sin esto, necesitarías presionar Enter para enviar entrada
-    enable_raw_mode()?;
-    
-    let mut stdout = io::stdout();  // Obtener salida estándar
-                                    // mut = mutable (es la única forma de modificarlo)
-    
-    // execute! = macro que ejecuta comandos en la terminal
-    // EnterAlternateScreen = cambiar a pantalla alternativa (como vim/less hacen)
-    // EnableMouseCapture = capturar clics del mouse
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    
-    // CrosstermBackend = configurar que Ratatui use Crossterm para la terminal
-    let backend = CrosstermBackend::new(stdout);
-    
-    // Terminal::new() = crear terminal
-    // &mut terminal = referencia mutable para poder dibujar en ella
-    let mut terminal = Terminal::new(backend)?;
-
-    // Crear la aplicación
-    let app = App::new();
-    
-    // Ejecutar el loop principal
-    // Si hay error, guardarlo en res
-    let res = run_app(&mut terminal, app);
-
-    // ========== CLEANUP - Restaurar terminal a estado anterior ==========
-    
-    disable_raw_mode()?;
-    
-    execute!(
-        terminal.backend_mut(),  // backend_mut() = acceder al backend mutablemente
-        LeaveAlternateScreen,    // Volver a pantalla normal
-        DisableMouseCapture      // Dejar de capturar mouse
-    )?;
-    
-    terminal.show_cursor()?;     // Mostrar el cursor (estaba oculto)
-
-    // Si hubo error en run_app(), imprimirlo
-    if let Err(err) = res {
-        // if let = destructuring (similar a pattern matching en Kotlin)
-        println!("{:?}", err);   // {:?} = formato de debug
+    if config.groups.is_empty() {
+        eprintln!("Error: No groups configured in config file");
+        return Ok(());
     }
 
-    Ok(())  // Retornar Ok (sin error)
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let app = App::new(config);
+    let res = run_app(&mut terminal, app);
+
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+
+    if let Err(err) = res {
+        eprintln!("Error: {}", err);
+    }
+
+    Ok(())
 }
 
 // ============================================================================
-// FUNCIÓN run_app - Loop principal
+// FUNCIÓN run_app
 // ============================================================================
-// Esta función contiene el "game loop" de la aplicación
 fn run_app(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,  // Terminal mutable
-    mut app: App  // App mutable (necesita ser mutable porque cambias selected)
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    mut app: App,
 ) -> io::Result<()> {
-    // io::Result<()> = puede ser Ok(()) o Err(io::Error)
-    
-    loop {  // Loop infinito (como while(true) en C++)
-        
-        // ========== DIBUJAR LA UI ==========
-        
-        // terminal.draw(|f| ...) = closure (lambda en JavaScript, función anónima en C++)
-        // f = referencia al Frame donde dibujamos
+    loop {
         terminal.draw(|f| ui(f, &app))?;
-        
-        // ========== LEER EVENTOS (teclado/mouse) ==========
-        
-        // event::poll() = esperar hasta timeout (250ms) a que ocurra un evento
-        // ? = si hay error, salir de la función con ese error
+
         if crossterm::event::poll(std::time::Duration::from_millis(250))? {
-            
-            // event::read() = leer el evento que ocurrió
             if let Event::Key(key) = event::read()? {
-                // if let = solo procesar si es un evento de teclado
-                
-                // match = comparar el código de tecla
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => {
-                        // | = OR, así que 'q' O Esc hacen lo mismo
-                        return Ok(());  // Salir del loop (terminar el programa)
+                        return Ok(());
                     }
-                    
                     KeyCode::Down | KeyCode::Char('j') => {
-                        // Flecha abajo o 'j' (vim-style navigation)
                         app.next();
                     }
-                    
                     KeyCode::Up | KeyCode::Char('k') => {
-                        // Flecha arriba o 'k' (vim-style navigation)
                         app.prev();
                     }
-                    
                     KeyCode::Enter => {
-                        // Enter = ejecutar la opción seleccionada
                         app.select();
-                        return Ok(());  // Salir después de ejecutar
+                        return Ok(());
                     }
-                    
-                    _ => {}  // Ignorar todas las otras teclas
+                    _ => {}
                 }
             }
         }
@@ -224,86 +241,65 @@ fn run_app(
 }
 
 // ============================================================================
-// FUNCIÓN ui - Renderizar la interfaz
+// FUNCIÓN ui
 // ============================================================================
-// &mut ratatui::Frame = referencia mutable al Frame (donde dibujamos)
-// &App = referencia inmutable a la app (solo lectura)
 fn ui(f: &mut ratatui::Frame, app: &App) {
-    // f.area() = obtener tamaño de la pantalla (rectángulo)
     let size = f.area();
 
-    // ========== LAYOUT ==========
-    
-    // Dividir la pantalla en 3 secciones verticales
-    // Layout::default() = usar configuración por defecto
     let chunks = Layout::default()
-        .direction(Direction::Vertical)  // Dividir verticalmente
-        .margin(2)                        // Margen de 2 espacios
+        .direction(Direction::Vertical)
+        .margin(2)
         .constraints(
             [
-                Constraint::Length(3),    // Sección 1: 3 líneas (título)
-                Constraint::Min(10),      // Sección 2: mínimo 10 líneas (lista)
-                Constraint::Length(3),    // Sección 3: 3 líneas (controles)
+                Constraint::Length(3),
+                Constraint::Min(10),
+                Constraint::Length(3),
             ]
-            .as_ref(),  // Convertir array a slice
+            .as_ref(),
         )
-        .split(size);  // Dividir el área según las constraints
+        .split(size);
 
-    // ========== SECCIÓN 1: TÍTULO ==========
-    
+    // Título
     let title = Paragraph::new("What are you going to do today?")
         .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
         .alignment(Alignment::Center);
-    
-    f.render_widget(title, chunks[0]);  // Dibujar en la sección 1
+    f.render_widget(title, chunks[0]);
 
-    // ========== SECCIÓN 2: LISTA DE OPCIONES ==========
-    
-    // Convertir vector de opciones a vector de ListItem (widgets renderizables)
+    // Lista de grupos
     let items: Vec<ListItem> = app
-        .options
-        .iter()          // Iterar sobre las opciones
-        .enumerate()     // Obtener (índice, valor)
-        .map(|(i, option)| {  // Para cada opción, crear un ListItem
-            
-            // Determinar estilo: si está seleccionada, destacar
+        .groups
+        .iter()
+        .enumerate()
+        .map(|(i, group)| {
             let style = if i == app.selected {
                 Style::default()
-                    .fg(Color::Black)           // Texto negro
-                    .bg(Color::Cyan)            // Fondo cyan
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)  // Texto blanco normal
+                Style::default().fg(Color::White)
             };
 
-            // Crear la línea de texto: "  ▸ Option"
-            let line = Line::from(Span::styled(
-                format!("  ▸ {}", option),  // format! = sprintf en C++
-                style,
-            ));
-
-            ListItem::new(line)  // Convertir en ListItem
+            let line = Line::from(Span::styled(format!("  ▸ {}", group), style));
+            ListItem::new(line)
         })
-        .collect();  // Recopilar todos en un Vec
+        .collect();
 
-    // Crear el widget List con los items
     let list = List::new(items)
         .block(
             Block::default()
-                .borders(Borders::ALL)    // Dibujar borde
-                .title(" Options ")       // Título del borde
-                .border_type(ratatui::widgets::BorderType::Rounded)  // Bordes redondeados
-                .style(Style::default().fg(Color::Cyan))
+                .borders(Borders::ALL)
+                .title(" Group Apps ")
+                .border_type(ratatui::widgets::BorderType::Rounded)
+                .style(Style::default().fg(Color::Cyan)),
         )
         .style(Style::default().fg(Color::White));
 
-    f.render_widget(list, chunks[1]);  // Dibujar en la sección 2
+    f.render_widget(list, chunks[1]);
 
-    // ========== SECCIÓN 3: FOOTER CON CONTROLES ==========
-    
+    // Footer
     let footer = Paragraph::new("↑/k: Up  |  ↓/j: Down  |  Enter: Select  |  q/Esc: Quit")
-        .style(Style::default().fg(Color::DarkGray))
+        .style(Style::default().fg(Color::White))
         .alignment(Alignment::Center);
-    
-    f.render_widget(footer, chunks[2]);  // Dibujar en la sección 3
+    f.render_widget(footer, chunks[2]);
 }
